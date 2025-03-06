@@ -572,6 +572,102 @@ public class MerkleTree {
     }
 
     /**
+     * Compare this tree with another tree to verify they have identical structure.
+     * This performs a full comparison of all nodes, their relationships, and hashes.
+     *
+     * @param otherTree The tree to compare with
+     * @return true if the trees match exactly, false otherwise
+     * @throws RocksDBException If there's an error accessing RocksDB
+     */
+    public boolean compareWithTree(MerkleTree otherTree) throws RocksDBException {
+        if (otherTree == null) {
+            return false;
+        }
+        
+        lock.readLock().lock();
+        try {
+            // Compare metadata
+            if (this.numLeaves != otherTree.numLeaves || this.depth != otherTree.depth) {
+                return false;
+            }
+            
+            // Compare root hashes
+            if (!Arrays.equals(this.rootHash, otherTree.rootHash)) {
+                return false;
+            }
+            
+            // If both trees are empty, they match
+            if (this.rootHash == null && otherTree.rootHash == null) {
+                return true;
+            }
+            
+            // Compare hanging nodes
+            if (this.hangingNodes.size() != otherTree.hangingNodes.size()) {
+                return false;
+            }
+            
+            for (Map.Entry<Integer, Node> entry : this.hangingNodes.entrySet()) {
+                Integer level = entry.getKey();
+                Node thisNode = entry.getValue();
+                Node otherNode = otherTree.hangingNodes.get(level);
+                
+                if (otherNode == null || !Arrays.equals(thisNode.hash, otherNode.hash)) {
+                    return false;
+                }
+            }
+            
+            // Recursively compare all nodes starting from the root
+            return compareNodes(this.rootHash, otherTree.rootHash, otherTree);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+    
+    /**
+     * Recursively compare nodes from both trees.
+     */
+    private boolean compareNodes(byte[] thisNodeHash, byte[] otherNodeHash, 
+                                MerkleTree otherTree) throws RocksDBException {
+        // If both hashes are null, nodes match
+        if (thisNodeHash == null && otherNodeHash == null) {
+            return true;
+        }
+        
+        // If only one hash is null, nodes don't match
+        if (thisNodeHash == null || otherNodeHash == null) {
+            return false;
+        }
+        
+        // If hashes are equal, check node structure
+        if (!Arrays.equals(thisNodeHash, otherNodeHash)) {
+            return false;
+        }
+        
+        // Get nodes from both trees
+        Node thisNode = getNodeByHash(thisNodeHash);
+        Node otherNode = otherTree.getNodeByHash(otherNodeHash);
+        
+        if (thisNode == null || otherNode == null) {
+            return false;
+        }
+        
+        // Compare left children
+        boolean leftMatch = compareNodes(thisNode.left, otherNode.left, otherTree);
+        if (!leftMatch) {
+            return false;
+        }
+        
+        // Compare right children
+        boolean rightMatch = compareNodes(thisNode.right, otherNode.right, otherTree);
+        if (!rightMatch) {
+            return false;
+        }
+        
+        // If we got here, nodes match
+        return true;
+    }
+
+    /**
      * Close the databases (optional, if you need cleanup).
      */
     public void close() throws RocksDBException {
