@@ -1087,7 +1087,17 @@ public class MerkleTree {
                 byte[] hash = db.get(metaDataHandle, (KEY_HANGING_NODE_PREFIX + i).getBytes());
                 if (hash != null) {
                     Node node = getNodeByHash(hash);
-                    hangingNodes.put(i, node.hash);
+                    if (node != null) {
+                        hangingNodes.put(i, node.hash);
+                    } else {
+                        // If node is not found, store the hash directly
+                        // This ensures we don't lose the hanging node information
+                        hangingNodes.put(i, hash);
+                        
+                        // Log a warning that a hanging node was not found in the database
+                        System.out.println("Warning: Hanging node not found in database for level " + i + 
+                                         ". Using stored hash instead.");
+                    }
                 }
             }
         } finally {
