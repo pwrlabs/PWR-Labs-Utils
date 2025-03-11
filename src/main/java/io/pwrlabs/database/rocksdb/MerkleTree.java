@@ -546,8 +546,9 @@ public class MerkleTree {
             // Calculate hash from key and data
             byte[] leafHash = PWRHash.hash256(key, data);
             
-            // Store key-data mapping
+            // Store key-data mapping in both cache and database
             keyDataCache.put(new ByteArrayWrapper(key), data);
+            db.put(keyDataHandle, key, data);
             
             if (existingData == null) {
                 // Key doesn't exist, add new leaf
@@ -556,10 +557,23 @@ public class MerkleTree {
                 // Key exists, update leaf
                 // First get the old leaf hash
                 byte[] oldLeafHash = PWRHash.hash256(key, existingData);
-                updateLeaf(oldLeafHash, leafHash);
+                
+                try {
+                    // Try to update the leaf, but handle the case where the leaf doesn't exist
+                    updateLeaf(oldLeafHash, leafHash);
+                } catch (IllegalArgumentException e) {
+                    // If the leaf doesn't exist, add it as a new leaf
+                    if (e.getMessage() != null && e.getMessage().startsWith("Leaf not found")) {
+                        addLeaf(new Node(leafHash));
+                    } else {
+                        // Re-throw other exceptions
+                        throw e;
+                    }
+                }
             }
             
-            flushToDisk();
+            // No need to flush to disk here - let the caller decide when to flush
+            // This improves performance for batch operations
         } finally {
             lock.writeLock().unlock();
         }
