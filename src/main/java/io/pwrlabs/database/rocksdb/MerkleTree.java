@@ -845,12 +845,29 @@ public class MerkleTree {
                 batch.put(metaDataHandle, KEY_NUM_LEAVES.getBytes(), ByteBuffer.allocate(4).putInt(numLeaves).array());
                 batch.put(metaDataHandle, KEY_DEPTH.getBytes(), ByteBuffer.allocate(4).putInt(depth).array());
 
+                // Ensure all hanging nodes are in the nodesCache
+                for (Map.Entry<Integer, byte[]> entry : hangingNodes.entrySet()) {
+                    byte[] nodeHash = entry.getValue();
+                    ByteArrayWrapper baw = new ByteArrayWrapper(nodeHash);
+                    if (!nodesCache.containsKey(baw)) {
+                        // If the node is not in the cache, try to get it from the database
+                        Node node = getNodeByHash(nodeHash);
+                        if (node == null) {
+                            // If the node is not in the database, create a new one
+                            node = new Node(nodeHash);
+                        }
+                        // The node constructor adds it to the nodesCache
+                    }
+                }
+
+                // Save hanging node metadata
                 for (Map.Entry<Integer, byte[]> entry : hangingNodes.entrySet()) {
                     Integer level = entry.getKey();
                     byte[] nodeHash = entry.getValue();
                     batch.put(metaDataHandle, (KEY_HANGING_NODE_PREFIX + level).getBytes(), nodeHash);
                 }
 
+                // Save all nodes in the cache
                 for (Node node : nodesCache.values()) {
                     batch.put(nodesHandle, node.hash, node.encode());
 
@@ -1087,7 +1104,18 @@ public class MerkleTree {
                 byte[] hash = db.get(metaDataHandle, (KEY_HANGING_NODE_PREFIX + i).getBytes());
                 if (hash != null) {
                     Node node = getNodeByHash(hash);
-                    hangingNodes.put(i, node.hash);
+                    if (node != null) {
+                        hangingNodes.put(i, node.hash);
+                    } else {
+                        // If node is not found, create a new node with the hash
+                        // This ensures we don't lose the hanging node information
+                        Node newNode = new Node(hash);
+                        hangingNodes.put(i, newNode.hash);
+                        
+                        // Log a warning that a hanging node was not found in the database
+                        System.out.println("Warning: Hanging node not found in database for level " + i + 
+                                         ". Created a new node with the hash.");
+                    }
                 }
             }
         } finally {
