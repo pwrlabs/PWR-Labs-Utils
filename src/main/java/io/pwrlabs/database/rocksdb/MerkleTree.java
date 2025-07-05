@@ -231,11 +231,12 @@ public class MerkleTree {
     public byte[] getData(byte[] key) {
         errorIfClosed();
         byte[] data = keyDataCache.get(new ByteArrayWrapper(key));
-        if(Arrays.equals(data, new byte[0])) {
-            // This means the key was previously checked and found to be null
-            return null;
+        if (data != null)  {
+            if(data.length == 1 & Arrays.equals(data, new byte[0])) {
+                // This means the key was not found, return null
+                return null;
+            } else return data;
         }
-        if (data != null) return data;
 
         long startTime = System.currentTimeMillis();
         try {
