@@ -231,11 +231,22 @@ public class MerkleTree {
     public byte[] getData(byte[] key) {
         errorIfClosed();
         byte[] data = keyDataCache.get(new ByteArrayWrapper(key));
+        if(Arrays.equals(data, new byte[0])) {
+            // This means the key was previously checked and found to be null
+            return null;
+        }
         if (data != null) return data;
 
         long startTime = System.currentTimeMillis();
         try {
-            return db.get(keyDataHandle, key);
+            data =  db.get(keyDataHandle, key);
+            if (data != null) {
+                keyDataCache.put(new ByteArrayWrapper(key), data);
+            } else {
+                // Place a null indicator in the cache
+                keyDataCache.put(new ByteArrayWrapper(key), new byte[0]);
+            }
+            return data;
         } catch (RocksDBException e) {
             throw new RuntimeException(e);
         } finally {
@@ -1361,57 +1372,25 @@ public class MerkleTree {
 
     public static void main(String[] args) throws Exception {
         MerkleTree tree = new MerkleTree("w1e21115we3/tree1");
-        tree.addOrUpdateData("key1".getBytes(), "value1".getBytes());
 
-        MerkleTree tree2 = tree.clone("we2151131we/tree2");
-
-        tree.addOrUpdateData("key2".getBytes(), "value2".getBytes());
+        long startTime = System.currentTimeMillis();
+        for (int t=0; t < 10000; ++t) {
+            tree.addOrUpdateData(
+                    ("key" + t).getBytes(),
+                    ("data" + t).getBytes()
+            );
+        }
         tree.flushToDisk();
 
-        System.out.println("u");
-        tree2.update(tree);
-        System.out.println("ud");
+        System.out.println("Added 10000 keys in " + (System.currentTimeMillis() - startTime) + " ms");
 
-        tree.flushToDisk();
-        tree2.flushToDisk();
-
-        //compare all keys and values of both trees
-        List<byte[]> keys1 = tree.getAllKeys();
-        List<byte[]> keys2 = tree2.getAllKeys();
-
-        List<byte[]> values1 = tree.getAllData();
-        List<byte[]> values2 = tree2.getAllData();
-
-        if (keys1.size() != keys2.size()) {
-            System.out.println("Keys size do not match: " + keys1.size() + " != " + keys2.size());
-        } else {
-            System.out.println("Keys size match: " + keys1.size());
+        startTime = System.currentTimeMillis();
+        for (int t=0; t < 10000; ++t) {
+            tree.getData(
+                    ("key" + t).getBytes()
+            );
         }
 
-        if (values1.size() != values2.size()) {
-            System.out.println("Values size do not match: " + values1.size() + " != " + values2.size());
-        } else {
-            System.out.println("Values size match: " + values1.size());
-        }
-
-        for (int i = 0; i < keys1.size(); i++) {
-            byte[] key1 = keys1.get(i);
-            byte[] value1 = values1.get(i);
-
-            byte[] key2 = keys2.get(i);
-            byte[] value2 = values2.get(i);
-
-            if (!Arrays.equals(key1, key2)) {
-                System.out.println("Keys do not match: " + Hex.toHexString(key1) + " != " + Hex.toHexString(key2));
-            } else {
-                System.out.println("Keys match: " + new String(key1));
-            }
-
-            if (!Arrays.equals(value1, value2)) {
-                System.out.println("Values do not match: " + Hex.toHexString(value1) + " != " + Hex.toHexString(value2));
-            } else {
-                System.out.println("Values match: " + new String(value1));
-            }
-        }
+        System.out.println("Read 10000 keys in " + (System.currentTimeMillis() - startTime) + " ms");
     }
 }
