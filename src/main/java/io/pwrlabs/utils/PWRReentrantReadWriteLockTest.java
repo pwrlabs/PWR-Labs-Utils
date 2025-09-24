@@ -143,42 +143,30 @@ class PWRReentrantReadWriteLockTest {
 
         // Low priority waiter
         Future<?> lowPriority = executor.submit(() -> {
-            try {
                 allStarted.countDown();
                 lock.acquireWriteLock(1); // Low priority
                 acquisitionOrder.add(1);
                 lock.releaseWriteLock();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         });
 
         Thread.sleep(50); // Ensure low priority starts waiting
 
         // High priority waiter
         Future<?> highPriority = executor.submit(() -> {
-            try {
                 allStarted.countDown();
                 lock.acquireWriteLock(10); // High priority
                 acquisitionOrder.add(10);
                 lock.releaseWriteLock();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         });
 
         Thread.sleep(50); // Ensure high priority starts waiting
 
         // Medium priority waiter
         Future<?> mediumPriority = executor.submit(() -> {
-            try {
                 allStarted.countDown();
                 lock.acquireWriteLock(5); // Medium priority
                 acquisitionOrder.add(5);
                 lock.releaseWriteLock();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         });
 
         holder.get(3, TimeUnit.SECONDS);
@@ -214,14 +202,10 @@ class PWRReentrantReadWriteLockTest {
         for (int i = 1; i <= 3; i++) {
             final int threadId = i;
             futures.add(executor.submit(() -> {
-                try {
                     allStarted.countDown();
                     lock.acquireWriteLock(5); // Same priority for all
                     acquisitionOrder.add(threadId);
                     lock.releaseWriteLock();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
             }));
             Thread.sleep(50); // Ensure ordering
         }
