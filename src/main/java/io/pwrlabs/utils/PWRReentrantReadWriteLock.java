@@ -16,6 +16,9 @@ import static io.pwrlabs.newerror.NewError.errorIf;
  */
 public class PWRReentrantReadWriteLock {
     private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(PWRReentrantReadWriteLock.class);
+    public static final int PRIORITY_LOW = 1;
+    public static final int PRIORITY_MEDIUM = 5;
+    public static final int PRIORITY_HIGH = 10;
 
     //region ==================== Fields ========================
     private final String lockName;
