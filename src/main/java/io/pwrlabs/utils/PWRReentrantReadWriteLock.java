@@ -1,266 +1,420 @@
 package io.pwrlabs.utils;
 
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static io.pwrlabs.newerror.NewError.errorIf;
 
 /**
- * A reentrant read-write lock implementation that extends Java's standard {@link ReadWriteLock} capabilities
- * with additional tracking functionality. This class keeps track of the number of active read locks,
- * the thread holding the write lock, and the timestamp when the write lock was acquired.
- *
- * <p>This implementation maintains the same thread safety and reentrant properties as the standard
- * {@link java.util.concurrent.locks.ReentrantReadWriteLock} while providing additional information
- * about lock state and ownership.</p>
- *
- * <p>The lock has two modes:</p>
- * <ul>
- *   <li>Read mode: Multiple threads can hold the read lock simultaneously</li>
- *   <li>Write mode: Only one thread can hold the write lock, excluding all read locks</li>
- * </ul>
+ * A priority-based reentrant read-write lock implementation that supports priority queuing
+ * and timeout functionality. Higher priority requests are granted locks first, and within
+ * the same priority level, latest requests have higher priority (LIFO).
  */
 public class PWRReentrantReadWriteLock {
+    private static final org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(PWRReentrantReadWriteLock.class);
+
     //region ==================== Fields ========================
-    /**
-     * The underlying read-write lock implementation
-     */
-    private ReadWriteLock readWriteLock;
-
-    private ReadWriteLock fieldsLock = new ReentrantReadWriteLock();
+    private final String lockName;
+    private final long unhealthyWriteLockAcquireMs;
 
     /**
-     * Counter tracking the number of active read locks
+     * Main lock for coordinating access
      */
-    private AtomicInteger readLockCount = new AtomicInteger(0);
-    private AtomicInteger writeLockCount = new AtomicInteger(0);
+    private final ReentrantLock mainLock = new ReentrantLock();
 
     /**
-     * Reference to the thread currently holding the write lock, or null if no thread holds it
+     * Priority queue for waiting threads
      */
-    private Thread writeLockThread = null;
+    private final PriorityBlockingQueue<WaitingThread> waitingQueue;
 
     /**
-     * Timestamp in nanoseconds when the write lock was acquired
-     * Value is 0 when no thread holds the write lock
+     * Map to track conditions for each waiting thread
      */
-    private long writeLockTime = 0; //Time in nanoseconds
+    private final Map<Thread, Condition> threadConditions = new ConcurrentHashMap<>();
+
+    /**
+     * Counter for request ordering within same priority
+     */
+    private final AtomicLong requestCounter = new AtomicLong(0);
+
+    /**
+     * Current state tracking
+     */
+    private final AtomicInteger activeReaders = new AtomicInteger(0);
+    private volatile Thread writeLockOwner = null;
+    private final AtomicInteger writeReentrantCount = new AtomicInteger(0);
+    private volatile long writeLockTime = 0;
+
+    /**
+     * Map to track read lock count per thread (for reentrancy)
+     */
+    private final Map<Thread, Integer> readHoldCounts = new ConcurrentHashMap<>();
+    //endregion
+
+    //region ==================== Inner Classes ========================
+    /**
+     * Represents a thread waiting for a lock with its priority and request time
+     */
+    private static class WaitingThread implements Comparable<WaitingThread> {
+        final Thread thread;
+        final int priority;
+        final long requestOrder; // For LIFO within same priority
+        final boolean isWriteRequest;
+
+        WaitingThread(Thread thread, int priority, long requestOrder, boolean isWriteRequest) {
+            this.thread = thread;
+            this.priority = priority;
+            this.requestOrder = requestOrder;
+            this.isWriteRequest = isWriteRequest;
+        }
+
+        @Override
+        public int compareTo(WaitingThread other) {
+            // Higher priority first
+            int priorityCompare = Integer.compare(other.priority, this.priority);
+            if (priorityCompare != 0) {
+                return priorityCompare;
+            }
+            // For same priority, latest request first (LIFO - higher requestOrder first)
+            return Long.compare(other.requestOrder, this.requestOrder);
+        }
+    }
     //endregion
 
     //region ==================== Constructor ========================
-
-    /**
-     * Creates a new PWRReentrantReadWriteLock instance.
-     * Initializes the underlying read-write lock as a {@link java.util.concurrent.locks.ReentrantReadWriteLock}.
-     */
-    protected PWRReentrantReadWriteLock() {
-        this.readWriteLock = new ReentrantReadWriteLock();
+    public PWRReentrantReadWriteLock(String lockName, long unhealthyWriteLockAcquireMs) {
+        this.lockName = lockName;
+        this.unhealthyWriteLockAcquireMs = unhealthyWriteLockAcquireMs;
+        this.waitingQueue = new PriorityBlockingQueue<>();
     }
     //endregion
 
     //region ==================== Public Getters ========================
-
-    /**
-     * Returns the thread that currently holds the write lock.
-     *
-     * @return The thread that currently holds the write lock, or null if the write lock is not held
-     */
     public Thread getWriteLockThread() {
-        fieldsLock.readLock().lock();
-        try {
-            return writeLockThread;
-        } finally {
-            fieldsLock.readLock().unlock();
-        }
+        return writeLockOwner;
     }
 
-    /**
-     * Returns the timestamp when the write lock was last acquired.
-     *
-     * @return The time when the write lock was last acquired in nanoseconds,
-     * or 0 if the lock is not currently held by any thread
-     */
     public long getWriteLockTime() {
-        fieldsLock.readLock().lock();
-        try {
-            return writeLockTime;
-        } finally {
-            fieldsLock.readLock().unlock();
-        }
+        return writeLockTime;
     }
 
-    /**
-     * Returns the number of active read locks.
-     *
-     * @return The number of active read locks
-     */
     public int getReadLockCount() {
-        fieldsLock.readLock().lock();
-        try {
-            return readLockCount.get();
-        } finally {
-            fieldsLock.readLock().unlock();
-        }
+        return activeReaders.get();
     }
 
-    /**
-     * Returns the number of active write locks.
-     *
-     * @return The number of active write locks
-     */
     public int getWriteLockCount() {
-        fieldsLock.readLock().lock();
-        try {
-            return writeLockCount.get();
-        } finally {
-            fieldsLock.readLock().unlock();
-        }
+        return writeReentrantCount.get();
     }
 
-    /**
-     * Checks if the write lock is held by the current thread.
-     *
-     * @return true if the write lock is held by the current thread, false otherwise
-     */
     public boolean isHeldByCurrentThread() {
-        fieldsLock.readLock().lock();
-        try {
-            return writeLockThread == Thread.currentThread();
-        } finally {
-            fieldsLock.readLock().unlock();
-        }
+        return writeLockOwner == Thread.currentThread();
     }
     //endregion
 
-    //region ==================== Public Methods ========================
+    //region ==================== Read Lock Methods ========================
+    /**
+     * Acquires the read lock with specified priority and timeout.
+     *
+     * @param priority Higher values indicate higher priority
+     * @param timeout Maximum time to wait
+     * @param unit Time unit for timeout
+     * @return true if lock was acquired, false if timeout
+     * @throws InterruptedException if interrupted while waiting
+     */
+    public boolean acquireReadLock(int priority, long timeout, TimeUnit unit) throws InterruptedException {
+        Thread currentThread = Thread.currentThread();
+        long nanos = unit.toNanos(timeout);
+        long deadline = System.nanoTime() + nanos;
+
+        mainLock.lock();
+        try {
+            // Check for read lock reentrancy
+            Integer holdCount = readHoldCounts.get(currentThread);
+            if (holdCount != null && holdCount > 0) {
+                readHoldCounts.put(currentThread, holdCount + 1);
+                activeReaders.incrementAndGet();
+                return true;
+            }
+
+            // Check if we can acquire immediately
+            if (canGrantReadLock(currentThread)) {
+                grantReadLock(currentThread);
+                return true;
+            }
+
+            // Add to waiting queue
+            WaitingThread waitingThread = new WaitingThread(
+                    currentThread, priority, requestCounter.incrementAndGet(), false
+            );
+            waitingQueue.offer(waitingThread);
+
+            Condition condition = mainLock.newCondition();
+            threadConditions.put(currentThread, condition);
+
+            try {
+                while (!canGrantReadLock(currentThread)) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        // Timeout occurred
+                        waitingQueue.remove(waitingThread);
+                        return false;
+                    }
+
+                    // Check if this thread is next in priority queue
+                    if (!isNextInQueue(currentThread)) {
+                        condition.awaitNanos(remaining);
+                    } else {
+                        condition.awaitNanos(remaining);
+                        if (canGrantReadLock(currentThread)) {
+                            waitingQueue.remove(waitingThread);
+                            grantReadLock(currentThread);
+                            return true;
+                        }
+                    }
+                }
+
+                waitingQueue.remove(waitingThread);
+                grantReadLock(currentThread);
+                return true;
+
+            } finally {
+                threadConditions.remove(currentThread);
+            }
+
+        } finally {
+            signalWaiters();
+            mainLock.unlock();
+        }
+    }
 
     /**
-     * Acquires the read lock.
-     *
-     * <p>Multiple threads can hold the read lock simultaneously, but the read lock
-     * cannot be acquired if any thread holds the write lock.</p>
-     *
-     * <p>This method will block until the read lock can be acquired.</p>
-     *
-     * <p>After this method returns successfully, the read lock count is incremented.</p>
+     * Convenience method - acquires read lock without timeout
      */
-    public void acquireReadLock() {
-        readWriteLock.readLock().lock();
-        readLockCount.incrementAndGet();
+    public void acquireReadLock(int priority) throws InterruptedException {
+        acquireReadLock(priority, Long.MAX_VALUE, TimeUnit.NANOSECONDS);
     }
 
     /**
      * Releases the read lock.
-     *
-     * <p>This method decrements the read lock count and releases the underlying read lock.</p>
-     *
-     * <p>This method should only be called by a thread that holds the read lock,
-     * otherwise the underlying lock implementation may throw an exception.</p>
      */
     public void releaseReadLock() {
-        readWriteLock.readLock().unlock();
-        readLockCount.decrementAndGet();
+        Thread currentThread = Thread.currentThread();
+
+        mainLock.lock();
+        try {
+            Integer holdCount = readHoldCounts.get(currentThread);
+            errorIf(holdCount == null || holdCount == 0,
+                    "Current thread does not hold read lock");
+
+            if (holdCount == 1) {
+                readHoldCounts.remove(currentThread);
+            } else {
+                readHoldCounts.put(currentThread, holdCount - 1);
+            }
+
+            int newCount = activeReaders.decrementAndGet();
+            if (newCount == 0) {
+                signalWaiters();
+            }
+        } finally {
+            mainLock.unlock();
+        }
+    }
+    //endregion
+
+    //region ==================== Write Lock Methods ========================
+    /**
+     * Acquires the write lock with specified priority and timeout.
+     *
+     * @param priority Higher values indicate higher priority
+     * @param timeout Maximum time to wait
+     * @param unit Time unit for timeout
+     * @return true if lock was acquired, false if timeout
+     * @throws InterruptedException if interrupted while waiting
+     */
+    public boolean acquireWriteLock(int priority, long timeout, TimeUnit unit) throws InterruptedException {
+        Thread currentThread = Thread.currentThread();
+        long startTime = System.currentTimeMillis();
+        long nanos = unit.toNanos(timeout);
+        long deadline = System.nanoTime() + nanos;
+
+        mainLock.lock();
+        try {
+            // Check for write lock reentrancy
+            if (writeLockOwner == currentThread) {
+                writeReentrantCount.incrementAndGet();
+                return true;
+            }
+
+            // Check if we can acquire immediately
+            if (canGrantWriteLock()) {
+                grantWriteLock(currentThread);
+                long endTime = System.currentTimeMillis();
+                if (endTime - startTime >= unhealthyWriteLockAcquireMs) {
+                    logger.error("acquireWriteLock took {} ms", (endTime - startTime));
+                }
+                return true;
+            }
+
+            // Add to waiting queue
+            WaitingThread waitingThread = new WaitingThread(
+                    currentThread, priority, requestCounter.incrementAndGet(), true
+            );
+            waitingQueue.offer(waitingThread);
+
+            Condition condition = mainLock.newCondition();
+            threadConditions.put(currentThread, condition);
+
+            try {
+                while (!canGrantWriteLock()) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        // Timeout occurred
+                        waitingQueue.remove(waitingThread);
+                        return false;
+                    }
+
+                    // Check if this thread is next in priority queue
+                    if (!isNextInQueue(currentThread)) {
+                        condition.awaitNanos(remaining);
+                    } else {
+                        condition.awaitNanos(remaining);
+                        if (canGrantWriteLock()) {
+                            waitingQueue.remove(waitingThread);
+                            grantWriteLock(currentThread);
+                            long endTime = System.currentTimeMillis();
+                            if (endTime - startTime >= unhealthyWriteLockAcquireMs) {
+                                logger.error("acquireWriteLock took {} ms", (endTime - startTime));
+                            }
+                            return true;
+                        }
+                    }
+                }
+
+                waitingQueue.remove(waitingThread);
+                grantWriteLock(currentThread);
+                long endTime = System.currentTimeMillis();
+                if (endTime - startTime >= unhealthyWriteLockAcquireMs) {
+                    logger.error("acquireWriteLock took {} ms", (endTime - startTime));
+                }
+                return true;
+
+            } finally {
+                threadConditions.remove(currentThread);
+            }
+
+        } finally {
+            signalWaiters();
+            mainLock.unlock();
+        }
     }
 
     /**
-     * Acquires the write lock.
-     *
-     * <p>The write lock can only be held by a single thread at a time and is exclusive
-     * with all read locks. This method will block until the write lock can be acquired.</p>
-     *
-     * <p>After this method returns successfully:</p>
-     * <ul>
-     *   <li>The current thread is set as the write lock holder</li>
-     *   <li>If this is the first acquisition (not a reentrant acquisition), the write lock
-     *       timestamp is updated to the current time in nanoseconds</li>
-     * </ul>
+     * Convenience method - acquires write lock without timeout
      */
-    public void acquireWriteLock() {
-        readWriteLock.writeLock().lock();
-
-        if(writeLockThread == null) {
-            writeLockThread = Thread.currentThread();
-            writeLockTime = System.nanoTime();
-        }
-
-        writeLockCount.incrementAndGet();
+    public void acquireWriteLock(int priority) throws InterruptedException {
+        acquireWriteLock(priority, Long.MAX_VALUE, TimeUnit.NANOSECONDS);
     }
 
     /**
      * Releases the write lock.
-     *
-     * <p>This method releases the write lock and clears the associated tracking information.</p>
-     *
-     * @throws IllegalStateException if the current thread does not hold the write lock
      */
     public void releaseWriteLock() {
-        errorIf(writeLockThread == null, "Write lock is not held by any thread");
-        errorIf(writeLockThread != Thread.currentThread(), "Current thread does not hold the write lock");
+        Thread currentThread = Thread.currentThread();
 
-        if (writeLockCount.decrementAndGet() == 0) {
-            writeLockThread = null;
-            writeLockTime = 0;
-        }
+        mainLock.lock();
+        try {
+            errorIf(writeLockOwner == null, "Write lock is not held by any thread");
+            errorIf(writeLockOwner != currentThread, "Current thread does not hold the write lock");
 
-        readWriteLock.writeLock().unlock();
-    }
-
-    public boolean tryToAcquireWriteLock() {
-        if (readWriteLock.writeLock().tryLock()) {
-            if (writeLockThread == null) {
-                writeLockThread = Thread.currentThread();
-                writeLockTime = System.nanoTime();
+            if (writeReentrantCount.decrementAndGet() == 0) {
+                writeLockOwner = null;
+                writeLockTime = 0;
+                signalWaiters();
             }
-            writeLockCount.incrementAndGet();
-            return true;
+        } finally {
+            mainLock.unlock();
         }
-        return false;
+    }
+
+    /**
+     * Attempts to acquire write lock without blocking.
+     *
+     * @return true if lock was acquired, false otherwise
+     */
+    public boolean tryToAcquireWriteLock() {
+        Thread currentThread = Thread.currentThread();
+
+        mainLock.lock();
+        try {
+            if (writeLockOwner == currentThread) {
+                writeReentrantCount.incrementAndGet();
+                return true;
+            }
+
+            if (canGrantWriteLock()) {
+                grantWriteLock(currentThread);
+                return true;
+            }
+
+            return false;
+        } finally {
+            mainLock.unlock();
+        }
     }
     //endregion
 
-    //region ==================== Private Methods ========================
-    private void setWriteLockThread(Thread thread) {
-        errorIf(thread == null, "Thread cannot be null");
-        fieldsLock.writeLock().lock();
-        try {
-            this.writeLockThread = thread;
-        } finally {
-            fieldsLock.writeLock().unlock();
+    //region ==================== Private Helper Methods ========================
+    private boolean canGrantReadLock(Thread thread) {
+        // Can grant read lock if no writer and no writer waiting with higher priority
+        if (writeLockOwner != null && writeLockOwner != thread) {
+            return false;
         }
+
+        // Check if there's a higher priority write request waiting
+        for (WaitingThread waiting : waitingQueue) {
+            if (waiting.thread == thread) {
+                continue;
+            }
+            if (waiting.isWriteRequest) {
+                // There's a write request waiting, can't grant read lock
+                return false;
+            }
+        }
+
+        return true;
     }
 
-    private void setWriteLockTime(long time) {
-        errorIf(time < 0, "Time cannot be negative");
-        fieldsLock.writeLock().lock();
-        try {
-            this.writeLockTime = time;
-        } finally {
-            fieldsLock.writeLock().unlock();
+    private boolean canGrantWriteLock() {
+        return writeLockOwner == null && activeReaders.get() == 0;
+    }
+
+    private void grantReadLock(Thread thread) {
+        activeReaders.incrementAndGet();
+        readHoldCounts.merge(thread, 1, Integer::sum);
+    }
+
+    private void grantWriteLock(Thread thread) {
+        writeLockOwner = thread;
+        writeLockTime = System.nanoTime();
+        writeReentrantCount.set(1);
+    }
+
+    private boolean isNextInQueue(Thread thread) {
+        WaitingThread peek = waitingQueue.peek();
+        return peek != null && peek.thread == thread;
+    }
+
+    private void signalWaiters() {
+        // Signal all waiting threads to re-check conditions
+        // They will check their priority order
+        for (Condition condition : threadConditions.values()) {
+            condition.signal();
         }
     }
     //endregion
-
-    public static void main(String[] args) {
-        PWRReentrantReadWriteLock lock = new PWRReentrantReadWriteLock();
-        lock.acquireReadLock();
-        System.out.println("Read lock acquired");
-        lock.releaseReadLock();
-        System.out.println("Read lock released");
-
-        lock.acquireWriteLock();
-        System.out.println("Write lock acquired");
-        lock.releaseWriteLock();
-        System.out.println("Write lock released");
-
-        //Dead lock test
-        lock.acquireWriteLock();
-        lock.acquireReadLock();
-        System.out.println("No dead lock");
-
-        lock.releaseReadLock();
-        lock.releaseWriteLock();
-    }
-
 }

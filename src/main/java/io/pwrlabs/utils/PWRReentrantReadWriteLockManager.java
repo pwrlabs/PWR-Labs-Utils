@@ -48,7 +48,7 @@ public class PWRReentrantReadWriteLockManager {
      * @throws RuntimeException if a lock with the specified name already exists,
      *         with the message "Lock with name [name] already exists"
      */
-    public static synchronized PWRReentrantReadWriteLock createReadWriteLock(String name) {
+    public static synchronized PWRReentrantReadWriteLock createReadWriteLock(String name, long unhealthyWriteLockAcquireMs) {
         WeakReference<PWRReentrantReadWriteLock> ref = readWriteLocks.get(name);
         PWRReentrantReadWriteLock existingLock = (ref != null) ? ref.get() : null;
 
@@ -60,7 +60,7 @@ public class PWRReentrantReadWriteLockManager {
             readWriteLocks.remove(name);
         }
 
-        PWRReentrantReadWriteLock lock = new PWRReentrantReadWriteLock();
+        PWRReentrantReadWriteLock lock = new PWRReentrantReadWriteLock(name, unhealthyWriteLockAcquireMs);
         readWriteLocks.put(name, new WeakReference<>(lock));
 
         return lock;
