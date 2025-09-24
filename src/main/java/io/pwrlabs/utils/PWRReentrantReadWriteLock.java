@@ -202,6 +202,13 @@ public class PWRReentrantReadWriteLock {
     }
 
     /**
+     * Convenience method - acquires read lock without timeout
+     */
+    public void acquireReadLock() throws InterruptedException {
+        acquireReadLock(PRIORITY_MEDIUM, Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+    }
+
+    /**
      * Releases the read lock.
      */
     public void releaseReadLock() {
