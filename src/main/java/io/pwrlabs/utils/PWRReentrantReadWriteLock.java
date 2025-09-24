@@ -330,8 +330,12 @@ public class PWRReentrantReadWriteLock {
     /**
      * Convenience method - acquires write lock without timeout
      */
-    public void acquireWriteLock(int priority) throws InterruptedException {
-        acquireWriteLock(priority, Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+    public void acquireWriteLock(int priority) {
+        try {
+            acquireWriteLock(priority, Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            throw new RuntimeException("Thread interrupted while acquiring write lock", e);
+        }
     }
 
     /**
