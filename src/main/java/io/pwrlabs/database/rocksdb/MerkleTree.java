@@ -1,6 +1,5 @@
 package io.pwrlabs.database.rocksdb;
 
-import ch.qos.logback.core.joran.sanity.Pair;
 import com.sun.tools.javac.Main;
 import io.pwrlabs.hashing.PWRHash;
 import io.pwrlabs.util.encoders.BiResult;
@@ -8,7 +7,9 @@ import io.pwrlabs.util.encoders.ByteArrayWrapper;
 import io.pwrlabs.util.encoders.Hex;
 import io.pwrlabs.util.files.FileUtils;
 import lombok.Getter;
+import lombok.SneakyThrows;
 import org.json.JSONObject;
+import org.junit.platform.commons.logging.LoggerFactory;
 import org.rocksdb.*;
 
 import java.io.File;
@@ -16,10 +17,8 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -99,10 +98,6 @@ public class MerkleTree {
      * Lock for reading/writing to the tree.
      */
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
-    private final AtomicLong submittedUpdates = new AtomicLong(0);
-    private final AtomicLong completedUpdates = new AtomicLong(0);
-    private final Object progressMon = new Object();
-    private final LinkedBlockingQueue<BiResult<byte[] /*New Key*/, byte[] /*New Value*/>> updateQueue = new LinkedBlockingQueue<>();
     //endregion
 
     //region ===================== Constructors =====================
@@ -134,63 +129,15 @@ public class MerkleTree {
         } catch (Exception e) {
             // Ignore compaction errors
         }
-
-        initUpdateQueue();
     }
 
     public MerkleTree(String treeName, boolean trackTimeOfOperations) throws RocksDBException {
         this(treeName);
         this.trackTimeOfOperations.set(trackTimeOfOperations);
     }
-
-    //Function to update new key-values from updateQeue
-    private void initUpdateQueue() {
-        Thread thread = new Thread(() -> {
-            while (true) {
-                long completedUpdatesThisBatch = 0;
-                try {
-                    // wait for at least one item
-                    BiResult<byte[], byte[]> first = updateQueue.take();
-
-                    lock.writeLock().lock();
-                    try {
-                        // process the first item
-                        addOrUpdateData_(first.getFirst(), first.getSecond());
-                        ++completedUpdatesThisBatch;
-
-                        // drain any backlog as a single batch under the same lock
-                        BiResult<byte[], byte[]> next;
-                        while ((next = updateQueue.poll()) != null) {
-                            addOrUpdateData_(next.getFirst(), next.getSecond());
-                            ++completedUpdatesThisBatch;
-                        }
-                    } catch (RocksDBException e) {
-                        e.printStackTrace();
-                    } finally {
-                        lock.writeLock().unlock(); // ALWAYS unlock after each batch
-                    }
-
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                } finally {
-                    if (completedUpdatesThisBatch > 0) {
-                        completedUpdates.addAndGet(completedUpdatesThisBatch);
-                        synchronized (progressMon) {
-                            progressMon.notifyAll();
-                        }
-                    }
-                }
-            }
-        });
-
-        thread.setDaemon(true);
-        thread.start();
-    }
-
     //endregion
 
-    //region ==================== Public Red Only Methods =====================
+    //region ===================== Public Methods =====================
 
     /**
      * Get the current root hash of the Merkle tree.
@@ -298,6 +245,78 @@ public class MerkleTree {
         }
     }
 
+    /**
+     * Add or update data for a key in the Merkle Tree.
+     * This will create a new leaf node with a hash derived from the key and data,
+     * or update an existing leaf if the key already exists.
+     *
+     * @param key  The key to store data for
+     * @param data The data to store
+     * @throws RocksDBException         If there's an error accessing RocksDB
+     * @throws IllegalArgumentException If key or data is null
+     */
+    public void addOrUpdateData(byte[] key, byte[] data) throws RocksDBException {
+        long startTime = System.currentTimeMillis();
+        errorIfClosed();
+
+        if (key == null) {
+            throw new IllegalArgumentException("Key cannot be null");
+        }
+        if (data == null) {
+            throw new IllegalArgumentException("Data cannot be null");
+        }
+
+        getWriteLock();
+        try {
+            //            Check if key already exists
+            byte[] existingData = getData(key);
+            byte[] oldLeafHash = existingData == null ? null : calculateLeafHash(key, existingData);
+
+            // Calculate hash from key and data
+            byte[] newLeafHash = calculateLeafHash(key, data);
+
+            if (oldLeafHash != null && Arrays.equals(oldLeafHash, newLeafHash)) return;
+
+            // Store key-data mapping
+            keyDataCache.put(new ByteArrayWrapper(key), data);
+            hasUnsavedChanges.set(true);
+
+            if (oldLeafHash == null) {
+                // Key doesn't exist, add new leaf
+                addLeaf(new Node(newLeafHash));
+            } else {
+                // Key exists, update leaf
+                // First get the old leaf hash
+                updateLeaf(oldLeafHash, newLeafHash);
+            }
+        } finally {
+            releaseWriteLock();
+            long endTime = System.currentTimeMillis();
+            if (trackTimeOfOperations.get() && endTime - startTime > 1)
+                System.out.println(treeName + " addOrUpdateData completed in " + (endTime - startTime) + " ms");
+        }
+    }
+
+    public void revertUnsavedChanges() {
+        if (!hasUnsavedChanges.get()) return;
+        errorIfClosed();
+
+        getWriteLock();
+        try {
+            nodesCache.clear();
+            hangingNodes.clear();
+            keyDataCache.clear();
+
+            loadMetaData();
+
+            hasUnsavedChanges.set(false);
+        } catch (RocksDBException e) {
+            throw new RuntimeException(e);
+        } finally {
+            releaseWriteLock();
+        }
+    }
+
     public boolean containsKey(byte[] key) {
         errorIfClosed();
 
@@ -371,52 +390,14 @@ public class MerkleTree {
         }
     }
 
-    public JSONObject getRamInfo() {
-        JSONObject json = new JSONObject();
-        json.put("treeName", treeName);
-        json.put("numLeaves", numLeaves);
-        json.put("depth", depth);
-        json.put("nodeCacheSize", nodesCache.size());
-        json.put("keyDataCacheSize", keyDataCache.size());
-        json.put("hangingNodesCacheSize", hangingNodes.size());
-        return json;
-    }
-    //endregion
-
-    //region ===================== Public Methods =====================
-    public void addOrUpdateData(byte[] key, byte[] data) throws RocksDBException {
-        submittedUpdates.incrementAndGet();
-        updateQueue.add(new BiResult<>(key, data));
-    }
-
-    public void revertUnsavedChanges() {
-        errorIfClosed();
-        awaitAllSubmittedUpdatesApplied();
-        if (!hasUnsavedChanges.get()) return;
-        getWriteLock();
-        try {
-            nodesCache.clear();
-            hangingNodes.clear();
-            keyDataCache.clear();
-
-            loadMetaData();
-
-            hasUnsavedChanges.set(false);
-        } catch (RocksDBException e) {
-            throw new RuntimeException(e);
-        } finally {
-            releaseWriteLock();
-        }
-    }
-
     /**
      * Flush all in-memory changes (nodes, metadata) to RocksDB.
      */
     public void flushToDisk() throws RocksDBException {
+        if (!hasUnsavedChanges.get()) return;
+
         long startTime = System.currentTimeMillis();
         errorIfClosed();
-        awaitAllSubmittedUpdatesApplied();
-        if (!hasUnsavedChanges.get()) return;
         getWriteLock();
         try {
             try (WriteBatch batch = new WriteBatch()) {
@@ -476,7 +457,6 @@ public class MerkleTree {
      */
     public void close() throws RocksDBException {
         long startTime = System.currentTimeMillis();
-        awaitAllSubmittedUpdatesApplied();
         getWriteLock();
         try {
             if (closed.get()) return;
@@ -552,7 +532,6 @@ public class MerkleTree {
             }
         }
 
-        awaitAllSubmittedUpdatesApplied();
         getWriteLock();
         try {
             flushToDisk();
@@ -577,7 +556,6 @@ public class MerkleTree {
     public void update(MerkleTree sourceTree) throws RocksDBException, IOException {
         long startTime = System.currentTimeMillis();
         errorIfClosed();
-        awaitAllSubmittedUpdatesApplied();
         getWriteLock();
         sourceTree.getWriteLock();
         try {
@@ -664,7 +642,6 @@ public class MerkleTree {
     public void clear() throws RocksDBException {
         long startTime = System.currentTimeMillis();
         errorIfClosed();
-        awaitAllSubmittedUpdatesApplied();
         getWriteLock();
         try {
             // mark every key in each CF as deleted (empty → 0xFF)
@@ -696,76 +673,21 @@ public class MerkleTree {
                 System.out.println(treeName + " cleared in " + (endTime - startTime) + " ms");
         }
     }
+
+    public JSONObject getRamInfo() {
+        JSONObject json = new JSONObject();
+        json.put("treeName", treeName);
+        json.put("numLeaves", numLeaves);
+        json.put("depth", depth);
+        json.put("nodeCacheSize", nodesCache.size());
+        json.put("keyDataCacheSize", keyDataCache.size());
+        json.put("hangingNodesCacheSize", hangingNodes.size());
+        return json;
+    }
+
     //endregion
 
     //region ===================== Private Methods =====================
-
-    /**
-     * Add or update data for a key in the Merkle Tree.
-     * This will create a new leaf node with a hash derived from the key and data,
-     * or update an existing leaf if the key already exists.
-     *
-     * @param key  The key to store data for
-     * @param data The data to store
-     * @throws RocksDBException         If there's an error accessing RocksDB
-     * @throws IllegalArgumentException If key or data is null
-     */
-    private void addOrUpdateData_(byte[] key, byte[] data) throws RocksDBException {
-        long startTime = System.currentTimeMillis();
-        errorIfClosed();
-
-        if (key == null) {
-            throw new IllegalArgumentException("Key cannot be null");
-        }
-        if (data == null) {
-            throw new IllegalArgumentException("Data cannot be null");
-        }
-
-        getWriteLock();
-        try {
-            //            Check if key already exists
-            byte[] existingData = getData(key);
-            byte[] oldLeafHash = existingData == null ? null : calculateLeafHash(key, existingData);
-
-            // Calculate hash from key and data
-            byte[] newLeafHash = calculateLeafHash(key, data);
-
-            if (oldLeafHash != null && Arrays.equals(oldLeafHash, newLeafHash)) return;
-
-            // Store key-data mapping
-            keyDataCache.put(new ByteArrayWrapper(key), data);
-            hasUnsavedChanges.set(true);
-
-            if (oldLeafHash == null) {
-                // Key doesn't exist, add new leaf
-                addLeaf(new Node(newLeafHash));
-            } else {
-                // Key exists, update leaf
-                // First get the old leaf hash
-                updateLeaf(oldLeafHash, newLeafHash);
-            }
-        } finally {
-            releaseWriteLock();
-            long endTime = System.currentTimeMillis();
-            if (trackTimeOfOperations.get() && endTime - startTime > 1)
-                System.out.println(treeName + " addOrUpdateData completed in " + (endTime - startTime) + " ms");
-        }
-    }
-
-    private void awaitAllSubmittedUpdatesApplied() {
-        long target = submittedUpdates.get(); // snapshot: “everything enqueued so far”
-        while (completedUpdates.get() < target) {
-            synchronized (progressMon) {
-                try {
-                    progressMon.wait(10);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }
-    }
-
     private void getWriteLock() {
         long startTime = System.currentTimeMillis();
         lock.writeLock().lock();
@@ -815,8 +737,7 @@ public class MerkleTree {
                 .setMaxBackgroundJobs(1)
                 .setInfoLogLevel(InfoLogLevel.FATAL_LEVEL)
                 .setAllowMmapReads(true)
-                .setAllowMmapWrites(false);
-        ;  // Enable memory-mapped reads for better performance
+                .setAllowMmapWrites(false); ;  // Enable memory-mapped reads for better performance
         // (omit setNoBlockCache or any “disable cache” flags)
 
         // 2) Table format: enable a 64 MB off-heap LRU cache
@@ -1439,23 +1360,58 @@ public class MerkleTree {
     //endregion
 
     public static void main(String[] args) throws Exception {
-        MerkleTree tree = new MerkleTree("w1e21115we3/tree12");
-        tree.clear();
-        tree.close();
+        MerkleTree tree = new MerkleTree("w1e21115we3/tree1");
+        tree.addOrUpdateData("key1".getBytes(), "value1".getBytes());
 
-        tree = new MerkleTree("w1e21115we3/tree12");
-        long startTime = System.currentTimeMillis();
+        MerkleTree tree2 = tree.clone("we2151131we/tree2");
 
-        for (int t = 0; t < 10000; ++t) {
-            byte[] key = ("key" + t).getBytes();
-            byte[] data = ("data" + t).getBytes();
-            tree.addOrUpdateData_(key, data);
-        }
-        System.out.println("Root hash: " + Hex.toHexString(tree.getRootHash()));
+        tree.addOrUpdateData("key2".getBytes(), "value2".getBytes());
+        tree.flushToDisk();
+
+        System.out.println("u");
+        tree2.update(tree);
+        System.out.println("ud");
 
         tree.flushToDisk();
-        tree.close();
+        tree2.flushToDisk();
 
-        System.out.println("Time taken to add 10,000 keys: " + (System.currentTimeMillis() - startTime) + " ms");
+        //compare all keys and values of both trees
+        List<byte[]> keys1 = tree.getAllKeys();
+        List<byte[]> keys2 = tree2.getAllKeys();
+
+        List<byte[]> values1 = tree.getAllData();
+        List<byte[]> values2 = tree2.getAllData();
+
+        if (keys1.size() != keys2.size()) {
+            System.out.println("Keys size do not match: " + keys1.size() + " != " + keys2.size());
+        } else {
+            System.out.println("Keys size match: " + keys1.size());
+        }
+
+        if (values1.size() != values2.size()) {
+            System.out.println("Values size do not match: " + values1.size() + " != " + values2.size());
+        } else {
+            System.out.println("Values size match: " + values1.size());
+        }
+
+        for (int i = 0; i < keys1.size(); i++) {
+            byte[] key1 = keys1.get(i);
+            byte[] value1 = values1.get(i);
+
+            byte[] key2 = keys2.get(i);
+            byte[] value2 = values2.get(i);
+
+            if (!Arrays.equals(key1, key2)) {
+                System.out.println("Keys do not match: " + Hex.toHexString(key1) + " != " + Hex.toHexString(key2));
+            } else {
+                System.out.println("Keys match: " + new String(key1));
+            }
+
+            if (!Arrays.equals(value1, value2)) {
+                System.out.println("Values do not match: " + Hex.toHexString(value1) + " != " + Hex.toHexString(value2));
+            } else {
+                System.out.println("Values match: " + new String(value1));
+            }
+        }
     }
 }
