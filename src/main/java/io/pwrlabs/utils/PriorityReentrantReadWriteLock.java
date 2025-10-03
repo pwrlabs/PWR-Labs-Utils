@@ -96,6 +96,10 @@ public class PriorityReentrantReadWriteLock {
         readWriteLock.readLock().unlock();
     }
 
+    public boolean isHeldByCurrentThread() {
+        return currentWriteLockHolders.get() == Thread.currentThread().getId();
+    }
+
     public static void main(String[] args) throws Exception {
         PriorityReentrantReadWriteLock lock = new PriorityReentrantReadWriteLock();
 
