@@ -7,7 +7,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class PriorityReentrantReadWriteLock {
-    private enum priority {HIGH, MEDIUM, LOW};
+    public enum priority {HIGH, MEDIUM, LOW};
 
     private final ReentrantReadWriteLock readWriteLock = new ReentrantReadWriteLock(true);
 
